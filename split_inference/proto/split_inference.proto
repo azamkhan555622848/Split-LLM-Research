@@ -1,0 +1,197 @@
+syntax = "proto3";
+
+package split_inference;
+
+// ============================================================================
+// Privacy-Preserving Split LLM Inference Protocol
+// ============================================================================
+// All activation tensors are serialized as raw bytes (float16/bfloat16).
+// Wire encryption is handled by mTLS at the gRPC channel level.
+// Application-level DP noise is added by the local server BEFORE serialization.
+// ============================================================================
+
+service SplitInferenceService {
+    // Prefill phase: send full prompt's hidden states in one batch.
+    // Returns the processed hidden states for all tokens.
+    rpc Prefill(PrefillRequest) returns (PrefillResponse);
+    
+    // Decode phase: send single new-token hidden state per step.
+    // The remote server maintains KV cache and returns output hidden state.
+    rpc Decode(DecodeRequest) returns (DecodeResponse);
+    
+    // Streaming decode: bidirectional stream for lower per-token overhead.
+    // Each message is one decode step. Avoids per-call gRPC overhead.
+    rpc StreamDecode(stream DecodeRequest) returns (stream DecodeResponse);
+    
+    // Session management
+    rpc CreateSession(CreateSessionRequest) returns (CreateSessionResponse);
+    rpc DestroySession(DestroySessionRequest) returns (DestroySessionResponse);
+    
+    // Health check
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ============================================================================
+// Session Management
+// ============================================================================
+
+message CreateSessionRequest {
+    string model_name = 1;          // e.g., "meta-llama/Llama-3.1-8B-Instruct"
+    int32 local_layers = 2;         // Split point K
+    int32 max_seq_len = 3;          // Max sequence length for this session
+    // DP metadata (so server knows noise was applied, for potential calibration)
+    DPMetadata dp_metadata = 4;
+}
+
+message CreateSessionResponse {
+    string session_id = 1;          // Unique session identifier
+    bool success = 2;
+    string error_message = 3;
+}
+
+message DestroySessionRequest {
+    string session_id = 1;
+}
+
+message DestroySessionResponse {
+    bool success = 1;
+}
+
+// ============================================================================
+// Differential Privacy Metadata
+// ============================================================================
+
+message DPMetadata {
+    bool dp_enabled = 1;
+    float epsilon = 2;
+    float delta = 3;
+    string mechanism = 4;           // "gaussian" or "laplace"
+    float clip_norm = 5;
+    // If perturbation is used, the server needs the seed to reverse it
+    bool perturbation_enabled = 6;
+    int64 perturbation_seed = 7;
+    float perturbation_scale = 8;
+}
+
+// ============================================================================
+// Prefill Phase
+// ============================================================================
+
+message PrefillRequest {
+    string session_id = 1;
+    
+    // Hidden states after local embedding + first K layers
+    // Shape: [seq_len, hidden_dim], serialized as raw bytes (float16)
+    bytes hidden_states = 2;
+    
+    // Positional information (needed for RoPE in remote layers)
+    repeated int64 position_ids = 3;
+    
+    // Sequence metadata
+    int32 seq_len = 4;
+    int32 hidden_dim = 5;
+    string dtype = 6;               // "float16" or "bfloat16"
+    
+    // Attention mask (optional, for padded batches)
+    bytes attention_mask = 7;
+    
+    // Noise metadata for this specific tensor (per-request DP tracking)
+    float noise_sigma = 8;          // Actual sigma used for this activation
+}
+
+message PrefillResponse {
+    // Output hidden states from the last remote layer
+    // Shape: [seq_len, hidden_dim]
+    bytes hidden_states = 1;
+    
+    bool success = 2;
+    string error_message = 3;
+    
+    // Performance telemetry
+    float compute_time_ms = 4;      // Time spent on GPU
+    float total_time_ms = 5;        // Including scheduling overhead
+}
+
+// ============================================================================
+// Decode Phase (single token per step)
+// ============================================================================
+
+message DecodeRequest {
+    string session_id = 1;
+    
+    // Hidden state for the NEW token only
+    // Shape: [1, hidden_dim] (single token)
+    bytes hidden_states = 2;
+    
+    // Position of the new token in the sequence
+    int64 position_id = 3;
+    
+    int32 hidden_dim = 4;
+    string dtype = 5;
+    
+    // Step counter (for KV cache indexing on the server)
+    int32 decode_step = 6;
+    
+    // Noise metadata
+    float noise_sigma = 7;
+}
+
+message DecodeResponse {
+    // Output hidden state for the decoded token
+    // Shape: [1, hidden_dim]
+    bytes hidden_states = 1;
+    
+    bool success = 2;
+    string error_message = 3;
+    
+    float compute_time_ms = 4;
+    float total_time_ms = 5;
+}
+
+// ============================================================================
+// Speculative Decoding (batch of candidate tokens)
+// ============================================================================
+
+message SpeculativeDecodeRequest {
+    string session_id = 1;
+    
+    // Hidden states for K candidate tokens (from local lookahead)
+    // Shape: [K, hidden_dim]
+    bytes hidden_states = 2;
+    
+    // Positions for each candidate
+    repeated int64 position_ids = 3;
+    
+    int32 num_candidates = 4;
+    int32 hidden_dim = 5;
+    string dtype = 6;
+    int32 decode_step = 7;
+    float noise_sigma = 8;
+}
+
+message SpeculativeDecodeResponse {
+    // Output hidden states for all candidates
+    // Shape: [K, hidden_dim]
+    bytes hidden_states = 1;
+    
+    // Which candidates were accepted (for KV cache management)
+    repeated bool accepted = 2;
+    int32 num_accepted = 3;
+    
+    bool success = 4;
+    string error_message = 5;
+}
+
+// ============================================================================
+// Health Check
+// ============================================================================
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+    bool healthy = 1;
+    int32 active_sessions = 2;
+    float gpu_utilization = 3;
+    float gpu_memory_used_gb = 4;
+    float gpu_memory_total_gb = 5;
+}
